@@ -69,6 +69,11 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
   console.log("Client connected to MAX Live API socket");
   
+  // Register error handler immediately to prevent uncaught exceptions on socket errors
+  ws.on("error", (error) => {
+    console.error("Client WS connection error:", error);
+  });
+  
   // Parse query parameters
   const urlObj = new URL(req.url || "", `http://${req.headers.host}`);
   const voice = urlObj.searchParams.get("voice") || "Puck"; // Puck is natural young energy, Zephyr or Aoede are female, Puck/Charon are male
@@ -121,7 +126,7 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
       callbacks: {
         onopen: () => {
           console.log(`Gemini Live Session connected for voice: ${voice}`);
-          if (!isClosed) {
+          if (!isClosed && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "session_ready", voice }));
           }
         },
@@ -130,18 +135,18 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
 
           // Process and forward audio data
           const audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-          if (audio) {
+          if (audio && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "audio", data: audio }));
           }
 
           // Handle seamless interruption
-          if (msg.serverContent?.interrupted) {
+          if (msg.serverContent?.interrupted && ws.readyState === WebSocket.OPEN) {
             console.log("Gemini session interrupted");
             ws.send(JSON.stringify({ type: "interrupted" }));
           }
 
           // Forward function calls (tools) to client browser
-          if (msg.toolCall) {
+          if (msg.toolCall && ws.readyState === WebSocket.OPEN) {
             console.log("Gemini requested toolCall:", JSON.stringify(msg.toolCall));
             ws.send(JSON.stringify({ type: "tool_call", toolCall: msg.toolCall }));
           }
@@ -149,13 +154,19 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
         onclose: (event) => {
           console.log("Gemini Live Session closed:", event);
           if (!isClosed) {
-            ws.send(JSON.stringify({ type: "session_closed" }));
-            ws.close();
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "session_closed" }));
+            }
+            try {
+              ws.close();
+            } catch (e) {
+              // Ignore already-closed error
+            }
           }
         },
         onerror: (err) => {
           console.error("Gemini Live Session error:", err);
-          if (!isClosed) {
+          if (!isClosed && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "error", message: "Gemini server connection error" }));
           }
         }
@@ -197,8 +208,14 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
 
   } catch (initErr: any) {
     console.error("Failed to connect to Gemini Live:", initErr);
-    ws.send(JSON.stringify({ type: "error", message: initErr.message || "Initialization failed" }));
-    ws.close();
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "error", message: initErr.message || "Initialization failed" }));
+    }
+    try {
+      ws.close();
+    } catch (e) {
+      // Ignore
+    }
   }
 
   ws.on("close", () => {
