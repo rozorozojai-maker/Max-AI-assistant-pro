@@ -1,0 +1,6 @@
+{
+  "name": "Voice Assistant MAX",
+  "description": "A high-fidelity real-time emotional voice-to-voice AI assistant speaking naturally in Hinglish.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
