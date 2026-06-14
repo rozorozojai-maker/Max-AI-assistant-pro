@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net default catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper Functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidPreference(data) {
+      return data.voice is string
+        && data.sarcasm is int
+        && data.stubborn is int
+        && data.mummy is int
+        && data.warmth is int
+        && data.customDirectives is string
+        && data.updatedAt is string;
+    }
+
+    function isValidMessage(data) {
+      return data.role is string
+        && (data.role == 'user' || data.role == 'model')
+        && data.text is string
+        && data.timestamp is string;
+    }
+
+    match /preferences/{userId} {
+      allow get: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidPreference(request.resource.data);
+      allow delete: if isOwner(userId);
+      
+      match /conversations/{messageId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidMessage(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

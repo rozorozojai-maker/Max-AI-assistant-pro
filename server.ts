@@ -77,6 +77,11 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
   // Parse query parameters
   const urlObj = new URL(req.url || "", `http://${req.headers.host}`);
   const voice = urlObj.searchParams.get("voice") || "Puck"; // Puck is natural young energy, Zephyr or Aoede are female, Puck/Charon are male
+  const sarcasm = urlObj.searchParams.get("sarcasm") || "40";
+  const stubborn = urlObj.searchParams.get("stubborn") || "15";
+  const mummy = urlObj.searchParams.get("mummy") || "10";
+  const warmth = urlObj.searchParams.get("warmth") || "35";
+  const directives = urlObj.searchParams.get("directives") || "";
   
   let geminiSession: any = null;
   let isClosed = false;
@@ -84,6 +89,19 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
   try {
     const aiInstance = getAIInstance();
     
+    // Build personalized system instruction using user preferences and memories from DB
+    let customizedInstruction = systemInstruction;
+    customizedInstruction += `\n\n[USER EMOTIONAL SLIDERS ADJUSTMENT]:\n` + 
+      `- Sarcastic Roast level: ${sarcasm}%\n` +
+      `- Obstinate Grumble level: ${stubborn}%\n` +
+      `- Indian Mom Comic Lecture level: ${mummy}%\n` +
+      `- Warm & Chill level: ${warmth}%\n` +
+      `Formulate your response tone to reflect these proportions. Play with them dynamically contextually!`;
+
+    if (directives.trim()) {
+      customizedInstruction += `\n\n[BOSS KRISHNA'S PERSISTED MEMORIES & DIRECTIVES DATABASE]:\n${directives}\n\nThis is your memory and context from the persistent database. Refer to these details or instructions.`;
+    }
+
     // Connect to Google Gemini Multimodal Live API
     geminiSession = await aiInstance.live.connect({
        model: "gemini-3.1-flash-live-preview",
@@ -96,7 +114,7 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
              }
            }
          },
-         systemInstruction: systemInstruction,
+         systemInstruction: customizedInstruction,
          // Declare local function calling tools
          tools: [
            {
@@ -137,6 +155,34 @@ wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
           const audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
           if (audio && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "audio", data: audio }));
+          }
+
+          // Detect and forward model text transcripts if available
+          let modelTranscript = "";
+          const parts = msg.serverContent?.modelTurn?.parts;
+          if (parts && Array.isArray(parts)) {
+            for (const part of parts) {
+              if (part.text) {
+                modelTranscript += part.text;
+              }
+            }
+          }
+          if (modelTranscript && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "transcript", role: "model", text: modelTranscript }));
+          }
+
+          // Detect and forward user voice-to-text transcripts if available
+          let userTranscript = "";
+          const userParts = msg.serverContent?.userTurn?.parts;
+          if (userParts && Array.isArray(userParts)) {
+            for (const part of userParts) {
+              if (part.text) {
+                userTranscript += part.text;
+              }
+            }
+          }
+          if (userTranscript && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "transcript", role: "user", text: userTranscript }));
           }
 
           // Handle seamless interruption

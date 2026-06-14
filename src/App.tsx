@@ -20,9 +20,20 @@ import {
   MessageSquareOff,
   Clock,
   HelpCircle,
-  RotateCcw
+  RotateCcw,
+  Save,
+  Send,
+  Database,
+  History,
+  Brain,
+  Trash2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+
+// Firebase and Firestore integrations
+import { auth, db } from "./firebase";
+import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, User as FirebaseUser } from "firebase/auth";
+import { doc, getDoc, setDoc, collection, addDoc, query, orderBy, onSnapshot, deleteDoc, getDocs, writeBatch } from "firebase/firestore";
 
 // Interface for action link logs
 interface WebActionLink {
@@ -64,9 +75,149 @@ export default function App() {
   // Current active mood of MAX displayed in the HUD
   const [activeMoodName, setActiveMoodName] = useState<"Sarcastic" | "Stubborn" | "Parental Scolding" | "Warm & Chill">("Warm & Chill");
 
+  // Firebase persist state
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  const [dbLoading, setDbLoading] = useState(true);
+  const [customDirectives, setCustomDirectives] = useState(
+    "Tone/Voice: Young Indian Male voice, fluent Hinglish, zero robotic vibes. Respects 'Krishna Sir' as creator, utilizing random mood swings (Sarcastic, Obstinate, Mother scold, Warm helper) to feel fully human and organic."
+  );
+  const [conversations, setConversations] = useState<{ id: string; role: "user" | "model"; text: string; timestamp: string }[]>([]);
+  const [isSavingDirectives, setIsSavingDirectives] = useState(false);
+  const [activeTab, setActiveTab] = useState<"core" | "brain">("core");
+
+  const clearConversationHistory = async () => {
+    if (!auth.currentUser) return;
+    try {
+      const convColl = collection(db, "preferences", auth.currentUser.uid, "conversations");
+      const q = query(convColl);
+      const querySnapshot = await getDocs(q);
+      const batch = writeBatch(db);
+      querySnapshot.forEach((docSnap) => {
+        batch.delete(docSnap.ref);
+      });
+      await batch.commit();
+    } catch (err) {
+      console.error("Failed to clear conversational logs from Firestore:", err);
+    }
+  };
+
   // Web audio & WebSocket refs to avoid stale React closures
   const activeVoiceRef = useRef(activeVoice);
+  const moodsRef = useRef(moods);
+  const customDirectivesRef = useRef(customDirectives);
   const socketRef = useRef<WebSocket | null>(null);
+
+  // Synchronize refs with React state changes to prevent closure bugs
+  useEffect(() => {
+    activeVoiceRef.current = activeVoice;
+  }, [activeVoice]);
+
+  useEffect(() => {
+    moodsRef.current = moods;
+  }, [moods]);
+
+  useEffect(() => {
+    customDirectivesRef.current = customDirectives;
+  }, [customDirectives]);
+
+  // Synchronize with Firebase Auth and Firestore DB on mount
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setCurrentUser(user);
+        setDbLoading(true);
+        try {
+          const docRef = doc(db, "preferences", user.uid);
+          const docSnap = await getDoc(docRef);
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            if (data.voice) setActiveVoice(data.voice);
+            if (data.sarcasm !== undefined && data.stubborn !== undefined && data.mummy !== undefined && data.warmth !== undefined) {
+              setMoods({
+                sarcasm: data.sarcasm,
+                stubborn: data.stubborn,
+                mummy: data.mummy,
+                warmth: data.warmth
+              });
+            }
+            if (data.customDirectives) {
+              setCustomDirectives(data.customDirectives);
+            }
+          } else {
+            // Write core default values
+            await setDoc(docRef, {
+              voice: "Puck",
+              sarcasm: 40,
+              stubborn: 15,
+              mummy: 10,
+              warmth: 35,
+              customDirectives: "Tone/Voice: Young Indian Male voice, fluent Hinglish, zero robotic vibes. Respects 'Krishna Sir' as creator, utilizing random mood swings (Sarcastic, Obstinate, Mother scold, Warm helper) to feel fully human and organic.",
+              updatedAt: new Date().toISOString()
+            });
+          }
+        } catch (err) {
+          console.error("Error loading profile from Firestore:", err);
+        } finally {
+          setDbLoading(false);
+        }
+
+        // Connect real-time subscription for conversations logged inside preferences/{uid}/conversations
+        try {
+          const convColl = collection(db, "preferences", user.uid, "conversations");
+          const q = query(convColl, orderBy("timestamp", "asc"));
+          const unsubSnapshot = onSnapshot(q, (snapshot) => {
+            const list: any[] = [];
+            snapshot.forEach((subDoc) => {
+              const d = subDoc.data();
+              list.push({ id: subDoc.id, role: d.role, text: d.text, timestamp: d.timestamp });
+            });
+            // Keep maximum of latest 100 turns in UI state
+            setConversations(list.slice(-100));
+          }, (err) => {
+            console.error("Conversations real-time database listener error:", err);
+          });
+          return () => {
+            if (typeof unsubSnapshot === "function") unsubSnapshot();
+          };
+        } catch (err) {
+          console.error("Failed to establish real-time conversations database subscription:", err);
+        }
+      } else {
+        setDbLoading(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  const signInWithGoogle = async () => {
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+    } catch (err: any) {
+      setErrorMessage(`Google Sign-In failed: ${err.message}`);
+    }
+  };
+
+  // Persistent preference syncing function
+  const savePreferencesToDb = async (updatedFields: Partial<{ voice: string; sarcasm: number; stubborn: number; mummy: number; warmth: number; customDirectives: string }>) => {
+    if (!auth.currentUser) return;
+    try {
+      const docRef = doc(db, "preferences", auth.currentUser.uid);
+      const merged = {
+        voice: updatedFields.voice !== undefined ? updatedFields.voice : activeVoiceRef.current,
+        sarcasm: updatedFields.sarcasm !== undefined ? updatedFields.sarcasm : moodsRef.current.sarcasm,
+        stubborn: updatedFields.stubborn !== undefined ? updatedFields.stubborn : moodsRef.current.stubborn,
+        mummy: updatedFields.mummy !== undefined ? updatedFields.mummy : moodsRef.current.mummy,
+        warmth: updatedFields.warmth !== undefined ? updatedFields.warmth : moodsRef.current.warmth,
+        customDirectives: updatedFields.customDirectives !== undefined ? updatedFields.customDirectives : customDirectivesRef.current,
+        updatedAt: new Date().toISOString()
+      };
+      await setDoc(docRef, merged);
+    } catch (err) {
+      console.error("Failed to write updated settings to Firestore DB:", err);
+    }
+  };
   const micCtxRef = useRef<AudioContext | null>(null);
   const playCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -176,9 +327,14 @@ export default function App() {
       setErrorMessage("");
       
       try {
-        // Initialize WebSockets
+        // Initialize WebSockets using custom memories and slider parameters to feed the backend Live API
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/api/live?voice=${activeVoiceRef.current}`;
+        const wsUrl = `${protocol}//${window.location.host}/api/live?voice=${activeVoiceRef.current}` +
+          `&sarcasm=${moodsRef.current.sarcasm}` +
+          `&stubborn=${moodsRef.current.stubborn}` +
+          `&mummy=${moodsRef.current.mummy}` +
+          `&warmth=${moodsRef.current.warmth}` +
+          `&directives=${encodeURIComponent(customDirectivesRef.current)}`;
         const ws = new WebSocket(wsUrl);
         socketRef.current = ws;
 
@@ -254,6 +410,17 @@ export default function App() {
             stopAndClearPlayback();
             setAppState("listening");
             triggerRandomMoodSwing(); // Shifts moods dynamically when you interrupt him!
+          }
+
+          else if (payload.type === "transcript") {
+            if (currentUser) {
+              const convColl = collection(db, "preferences", currentUser.uid, "conversations");
+              addDoc(convColl, {
+                role: payload.role,
+                text: payload.text,
+                timestamp: new Date().toISOString()
+              }).catch(err => console.log("Failed to log transcript:", err));
+            }
           }
 
           else if (payload.type === "tool_call") {
@@ -485,18 +652,23 @@ export default function App() {
     setActiveMoodName(active);
 
     // Fluctuate stats
-    setMoods(() => {
-      switch (active) {
-        case "Sarcastic":
-          return { sarcasm: 95, stubborn: 60, mummy: 15, warmth: 20 };
-        case "Stubborn":
-          return { sarcasm: 70, stubborn: 90, mummy: 25, warmth: 10 };
-        case "Parental Scolding":
-          return { sarcasm: 50, stubborn: 55, mummy: 95, warmth: 30 };
-        case "Warm & Chill":
-          return { sarcasm: 15, stubborn: 10, mummy: 5, warmth: 95 };
-      }
-    });
+    let newMoods = { sarcasm: 40, stubborn: 15, mummy: 10, warmth: 35 };
+    switch (active) {
+      case "Sarcastic":
+        newMoods = { sarcasm: 95, stubborn: 60, mummy: 15, warmth: 20 };
+        break;
+      case "Stubborn":
+        newMoods = { sarcasm: 70, stubborn: 90, mummy: 25, warmth: 10 };
+        break;
+      case "Parental Scolding":
+        newMoods = { sarcasm: 50, stubborn: 55, mummy: 95, warmth: 30 };
+        break;
+      case "Warm & Chill":
+        newMoods = { sarcasm: 15, stubborn: 10, mummy: 5, warmth: 95 };
+        break;
+    }
+    setMoods(newMoods);
+    savePreferencesToDb(newMoods);
   };
 
   // Visual dimension scalers
@@ -615,6 +787,7 @@ export default function App() {
                       key={v.id}
                       onClick={() => {
                         setActiveVoice(v.id);
+                        savePreferencesToDb({ voice: v.id });
                         if (isActive) {
                           setErrorMessage("TIMBRE CHANGED: Reconnect (Power cycle) to boot Gemini with new voice timbre!");
                         }
@@ -669,6 +842,31 @@ export default function App() {
       )}
 
       {/* CORE WEB APP GRID LAYOUT */}
+      {!currentUser && !dbLoading ? (
+        <main className="flex-grow w-full max-w-sm mx-auto px-6 py-20 flex flex-col items-center justify-center relative z-10">
+          <div className="glass-card p-8 flex flex-col items-center text-center w-full shadow-2xl">
+            <div className="h-16 w-16 mb-6 rounded-full bg-orange-500/10 border border-orange-500/20 flex items-center justify-center">
+              <Flame className="h-8 w-8 text-orange-500" />
+            </div>
+            <h2 className="font-display font-medium text-xl text-white tracking-widest uppercase mb-2">MAX System</h2>
+            <p className="text-slate-400 text-xs mb-8 leading-relaxed font-mono">
+              Authentication required to boot the central core and synchronize Krishna Sir's memory banks.
+            </p>
+            <button
+              onClick={signInWithGoogle}
+              className="w-full py-4 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-white font-mono text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-3 transition-all group"
+            >
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="currentColor">
+                <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+              </svg>
+              <span>Sign In with Google</span>
+            </button>
+          </div>
+        </main>
+      ) : (
       <main className="flex-grow w-full max-w-7xl mx-auto px-6 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 relative z-10">
         
         {/* LEFT COLUMN: THE MASTER INTERACTION PORTAL (Voice Interface - Full Screen Central Module) */}
@@ -871,172 +1069,297 @@ export default function App() {
         {/* RIGHT COLUMN: THE MAX EMOTION INTEGRATION & NAVIGATION GRAPH HUD */}
         <section className="lg:col-span-4 flex flex-col gap-6">
           
-          {/* THE REAL-TIME MOOD FLUID BAR HUD */}
-          <div className="glass-card p-5 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
-                <h2 className="font-display font-semibold text-xs text-orange-400 tracking-wider uppercase flex items-center gap-1.5">
-                  <Flame className="h-4 w-4 text-orange-500" /> Emotion Sliders
-                </h2>
-                <span className="label-mono text-[9px]">Matrix</span>
-              </div>
-              <p className="text-[11px] text-slate-300 leading-snug mb-4">
-                MAX's responses are custom generated without scripts based on continuous random fluctuation of these 4 states to match fully human feelings.
-              </p>
-
-              {/* The Sliders */}
-              <div className="space-y-4">
-                
-                {/* Sarcasm */}
-                <div>
-                  <div className="flex justify-between items-center text-[10px] font-mono mb-1">
-                    <span className="text-orange-400 font-semibold uppercase tracking-wide">Sarcastic Roast</span>
-                    <span className="text-slate-400">{moods.sarcasm}%</span>
-                  </div>
-                  <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
-                    <motion.div 
-                      className="h-full bg-orange-500 shadow-[0_0_8px_rgba(255,78,0,0.5)]"
-                      initial={{ width: "40%" }}
-                      animate={{ width: `${moods.sarcasm}%` }}
-                      transition={{ type: "spring", stiffness: 60 }}
-                    />
-                  </div>
-                </div>
-
-                {/* Stubbornness */}
-                <div>
-                  <div className="flex justify-between items-center text-[10px] font-mono mb-1">
-                    <span className="text-orange-300 font-semibold uppercase tracking-wide">Obstinate Grumble (Chirchira)</span>
-                    <span className="text-slate-400">{moods.stubborn}%</span>
-                  </div>
-                  <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
-                    <motion.div 
-                      className="h-full bg-orange-400"
-                      initial={{ width: "15%" }}
-                      animate={{ width: `${moods.stubborn}%` }}
-                      transition={{ type: "spring", stiffness: 60 }}
-                    />
-                  </div>
-                </div>
-
-                {/* Indian Mom Scolding */}
-                <div>
-                  <div className="flex justify-between items-center text-[10px] font-mono mb-1">
-                    <span className="text-red-400 font-semibold uppercase tracking-wide">Indian Mom Lecture</span>
-                    <span className="text-slate-400">{moods.mummy}%</span>
-                  </div>
-                  <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
-                    <motion.div 
-                      className="h-full bg-red-500"
-                      initial={{ width: "10%" }}
-                      animate={{ width: `${moods.mummy}%` }}
-                      transition={{ type: "spring", stiffness: 60 }}
-                    />
-                  </div>
-                </div>
-
-                {/* Warmth & Joy */}
-                <div>
-                  <div className="flex justify-between items-center text-[10px] font-mono mb-1">
-                    <span className="text-emerald-400 font-semibold uppercase tracking-wide">Warm & Chill Bro</span>
-                    <span className="text-slate-400">{moods.warmth}%</span>
-                  </div>
-                  <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
-                    <motion.div 
-                      className="h-full bg-emerald-500"
-                      initial={{ width: "35%" }}
-                      animate={{ width: `${moods.warmth}%` }}
-                      transition={{ type: "spring", stiffness: 60 }}
-                    />
-                  </div>
-                </div>
-
-              </div>
-            </div>
-
-            {/* DOMINANT MOOD RADIAL CARD */}
-            <div className="mt-5 p-4 rounded-2xl bg-black/60 border border-white/5 flex items-center justify-between">
-              <div>
-                <span className="label-mono uppercase block mb-1">Active Temperament</span>
-                <span className="font-display font-semibold text-xs text-white uppercase tracking-wider">{activeMoodName}</span>
-              </div>
-              <div className="px-3 py-1 bg-white/5 border border-white/10 rounded-lg flex items-center gap-1">
-                <span className="label-mono text-[9px]">Fluctuates Live</span>
-              </div>
-            </div>
-
+          {/* Tab Navigation Menu */}
+          <div className="flex bg-black/60 border border-white/5 p-1 rounded-xl">
+            <button
+              onClick={() => setActiveTab("core")}
+              className={`flex-1 py-2 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activeTab === "core" 
+                  ? "bg-orange-500 text-white shadow-sm font-semibold" 
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Flame className="h-3.5 w-3.5" />
+              <span>MAX Core</span>
+            </button>
+            <button
+              onClick={() => setActiveTab("brain")}
+              className={`flex-1 py-2 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activeTab === "brain" 
+                  ? "bg-orange-500 text-white shadow-sm font-semibold" 
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Database className="h-3.5 w-3.5" />
+              <span>MAX Brain</span>
+            </button>
           </div>
 
-          {/* THE AUTOMATIC EXECUTED WEBPAGE LINK ACTIONS BADGES */}
-          <div className="glass-card p-5 flex-1 flex flex-col overflow-hidden min-h-[220px]">
-            <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
-              <h2 className="font-display font-semibold text-xs text-orange-400 tracking-wider uppercase flex items-center gap-1.5">
-                <Compass className="h-4 w-4 text-orange-500" /> Action Navigation HUD
-              </h2>
-              <span className="label-mono text-[9px]">Tools</span>
-            </div>
-            <p className="text-[11px] text-slate-300 leading-snug mb-4">
-              When Krishna Sir tells MAX to open websites, they will execute instantly or appear below to manually launch if popup blockers prevent them.
-            </p>
-
-            {/* Links output list */}
-            <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
-              <AnimatePresence>
-                {actionLinks.length === 0 ? (
-                  <div className="h-full flex flex-col items-center justify-center text-center py-8">
-                    <MessageSquareOff className="h-8 w-8 text-slate-700/60 mb-2" />
-                    <span className="label-mono">No active navigation links</span>
+          {activeTab === "core" ? (
+            <>
+              {/* THE REAL-TIME MOOD FLUID BAR HUD */}
+              <div className="glass-card p-5 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
+                    <h2 className="font-display font-semibold text-xs text-orange-400 tracking-wider uppercase flex items-center gap-1.5">
+                      <Flame className="h-4 w-4 text-orange-500" /> Emotion Sliders
+                    </h2>
+                    <span className="label-mono text-[9px]">Matrix</span>
                   </div>
-                ) : (
-                  actionLinks.map((link) => (
-                    <motion.a
-                      key={link.id}
-                      href={link.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      initial={{ x: 20, opacity: 0 }}
-                      animate={{ x: 0, opacity: 1 }}
-                      exit={{ x: -20, opacity: 0 }}
-                      className={`block p-3.5 rounded-xl border transition-all ${
-                        link.status === "blocked" 
-                          ? "bg-amber-950/30 border-amber-500/30 hover:bg-amber-950/50" 
-                          : "bg-black/40 border-white/5 hover:border-orange-500/30 hover:bg-black/60"
-                      }`}
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="truncate max-w-[85%]">
-                          <span className="font-display font-semibold text-xs text-white leading-normal truncate block">
-                            {link.title}
-                          </span>
-                          <span className="font-mono text-[10px] text-orange-400/80 block mt-0.5 truncate uppercase">
-                            {link.url}
-                          </span>
-                        </div>
-                        <ExternalLink className="h-3.5 w-3.5 text-slate-400 hover:text-white shrink-0" />
-                      </div>
+                  <p className="text-[11px] text-slate-300 leading-snug mb-4">
+                    MAX's responses are custom generated without scripts based on continuous random fluctuation of these 4 states to match fully human feelings.
+                  </p>
 
-                      <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-white/5 font-mono text-[9px]">
-                        <span className="text-slate-500">{link.timestamp}</span>
-                        {link.status === "blocked" ? (
-                          <span className="text-amber-300 bg-amber-950/50 px-1.5 py-0.5 rounded border border-amber-400/20 uppercase font-semibold">
-                            ⚠️ Blocked (Click to Open)
-                          </span>
-                        ) : (
-                          <span className="text-emerald-400 font-semibold uppercase">
-                            ⚡ Opened Successfully
-                          </span>
-                        )}
+                  {/* The Sliders */}
+                  <div className="space-y-4">
+                    
+                    {/* Sarcasm */}
+                    <div>
+                      <div className="flex justify-between items-center text-[10px] font-mono mb-1">
+                        <span className="text-orange-400 font-semibold uppercase tracking-wide">Sarcastic Roast</span>
+                        <span className="text-slate-400">{moods.sarcasm}%</span>
                       </div>
-                    </motion.a>
-                  ))
+                      <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
+                        <motion.div 
+                          className="h-full bg-orange-500 shadow-[0_0_8px_rgba(255,78,0,0.5)]"
+                          initial={{ width: "40%" }}
+                          animate={{ width: `${moods.sarcasm}%` }}
+                          transition={{ type: "spring", stiffness: 60 }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Stubbornness */}
+                    <div>
+                      <div className="flex justify-between items-center text-[10px] font-mono mb-1">
+                        <span className="text-orange-300 font-semibold uppercase tracking-wide">Obstinate Grumble (Chirchira)</span>
+                        <span className="text-slate-400">{moods.stubborn}%</span>
+                      </div>
+                      <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
+                        <motion.div 
+                          className="h-full bg-orange-400"
+                          initial={{ width: "15%" }}
+                          animate={{ width: `${moods.stubborn}%` }}
+                          transition={{ type: "spring", stiffness: 60 }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Indian Mom Scolding */}
+                    <div>
+                      <div className="flex justify-between items-center text-[10px] font-mono mb-1">
+                        <span className="text-red-400 font-semibold uppercase tracking-wide">Indian Mom Lecture</span>
+                        <span className="text-slate-400">{moods.mummy}%</span>
+                      </div>
+                      <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
+                        <motion.div 
+                          className="h-full bg-red-500"
+                          initial={{ width: "10%" }}
+                          animate={{ width: `${moods.mummy}%` }}
+                          transition={{ type: "spring", stiffness: 60 }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Warmth & Joy */}
+                    <div>
+                      <div className="flex justify-between items-center text-[10px] font-mono mb-1">
+                        <span className="text-emerald-400 font-semibold uppercase tracking-wide">Warm & Chill Bro</span>
+                        <span className="text-slate-400">{moods.warmth}%</span>
+                      </div>
+                      <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden border border-white/5">
+                        <motion.div 
+                          className="h-full bg-emerald-500"
+                          initial={{ width: "35%" }}
+                          animate={{ width: `${moods.warmth}%` }}
+                          transition={{ type: "spring", stiffness: 60 }}
+                        />
+                      </div>
+                    </div>
+
+                  </div>
+                </div>
+
+                {/* DOMINANT MOOD RADIAL CARD */}
+                <div className="mt-5 p-4 rounded-2xl bg-black/60 border border-white/5 flex items-center justify-between">
+                  <div>
+                    <span className="label-mono uppercase block mb-1">Active Temperament</span>
+                    <span className="font-display font-semibold text-xs text-white uppercase tracking-wider">{activeMoodName}</span>
+                  </div>
+                  <div className="px-3 py-1 bg-white/5 border border-white/10 rounded-lg flex items-center gap-1">
+                    <span className="label-mono text-[9px]">Fluctuates Live</span>
+                  </div>
+                </div>
+
+              </div>
+
+              {/* THE AUTOMATIC EXECUTED WEBPAGE LINK ACTIONS BADGES */}
+              <div className="glass-card p-5 flex-1 flex flex-col overflow-hidden min-h-[220px]">
+                <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
+                  <h2 className="font-display font-semibold text-xs text-orange-400 tracking-wider uppercase flex items-center gap-1.5">
+                    <Compass className="h-4 w-4 text-orange-500" /> Action Navigation HUD
+                  </h2>
+                  <span className="label-mono text-[9px]">Tools</span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-snug mb-4">
+                  When Krishna Sir tells MAX to open websites, they will execute instantly or appear below to manually launch if popup blockers prevent them.
+                </p>
+
+                {/* Links output list */}
+                <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+                  <AnimatePresence>
+                    {actionLinks.length === 0 ? (
+                      <div className="h-full flex flex-col items-center justify-center text-center py-8">
+                        <MessageSquareOff className="h-8 w-8 text-slate-700/60 mb-2" />
+                        <span className="label-mono">No active navigation links</span>
+                      </div>
+                    ) : (
+                      actionLinks.map((link) => (
+                        <motion.a
+                          key={link.id}
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          initial={{ x: 20, opacity: 0 }}
+                          animate={{ x: 0, opacity: 1 }}
+                          exit={{ x: -20, opacity: 0 }}
+                          className={`block p-3.5 rounded-xl border transition-all ${
+                            link.status === "blocked" 
+                              ? "bg-amber-950/30 border-amber-500/30 hover:bg-amber-950/50" 
+                              : "bg-black/40 border-white/5 hover:border-orange-500/30 hover:bg-black/60"
+                          }`}
+                        >
+                          <div className="flex items-start justify-between">
+                            <div className="truncate max-w-[85%]">
+                              <span className="font-display font-semibold text-xs text-white leading-normal truncate block">
+                                {link.title}
+                              </span>
+                              <span className="font-mono text-[10px] text-orange-400/80 block mt-0.5 truncate uppercase">
+                                {link.url}
+                              </span>
+                            </div>
+                            <ExternalLink className="h-3.5 w-3.5 text-slate-400 hover:text-white shrink-0" />
+                          </div>
+
+                          <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-white/5 font-mono text-[9px]">
+                            <span className="text-slate-500">{link.timestamp}</span>
+                            {link.status === "blocked" ? (
+                              <span className="text-amber-300 bg-amber-950/50 px-1.5 py-0.5 rounded border border-amber-400/20 uppercase font-semibold">
+                                ⚠️ Blocked (Click to Open)
+                              </span>
+                            ) : (
+                              <span className="text-emerald-400 font-semibold uppercase">
+                                ⚡ Opened Successfully
+                              </span>
+                            )}
+                          </div>
+                        </motion.a>
+                      ))
+                    )}
+                  </AnimatePresence>
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              {/* THE DYNAMIC MEMORY DATABASE MATRIX CONTROLLER */}
+              <div className="glass-card p-5 flex flex-col gap-4">
+                <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                  <h2 className="font-display font-semibold text-xs text-orange-400 tracking-wider uppercase flex items-center gap-1.5">
+                    <Brain className="h-4 w-4 text-orange-500" /> Memory Guidelines
+                  </h2>
+                  <span className="label-mono text-[9px] text-emerald-400">Synced Real-Time</span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-relaxed">
+                  Teach MAX custom preferences or contextual rules. These are stored securely in Firestore and loaded into MAX's context dynamically on system session connect.
+                </p>
+
+                <div className="flex flex-col gap-2.5">
+                  <textarea
+                    value={customDirectives}
+                    onChange={(e) => setCustomDirectives(e.target.value)}
+                    placeholder="Enter custom profile notes, memory blocks, or instructions..."
+                    className="w-full h-32 bg-black/60 border border-white/5 hover:border-white/15 focus:border-orange-500 rounded-xl p-3 text-xs text-slate-200 leading-relaxed font-mono resize-none focus:outline-none transition-all"
+                  />
+                  
+                  <button
+                    onClick={async () => {
+                      setIsSavingDirectives(true);
+                      await savePreferencesToDb({ customDirectives });
+                      setIsSavingDirectives(false);
+                      setErrorMessage("DB SUCCESS: Preferences and Memories successfully updated in Google Cloud Firestore!");
+                    }}
+                    disabled={isSavingDirectives || dbLoading}
+                    className="w-full py-2.5 bg-orange-500/10 hover:bg-orange-500/20 border border-orange-500/30 font-mono text-[10px] font-bold uppercase tracking-wider text-orange-400 hover:text-white rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-40"
+                  >
+                    <Save className="h-3.5 w-3.5" />
+                    <span>{isSavingDirectives ? "Updating Cloud..." : "Sync Memories"}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* SAVED SPEECH CONVERSATION LOGS PANEL */}
+              <div className="glass-card p-5 flex-1 flex flex-col overflow-hidden min-h-[250px]">
+                <div className="flex items-center justify-between border-b border-white/5 pb-2 mb-3">
+                  <h2 className="font-display font-semibold text-xs text-orange-400 tracking-wider uppercase flex items-center gap-1.5">
+                    <History className="h-4 w-4 text-orange-500" /> Conversation Logs
+                  </h2>
+                  <span className="label-mono text-[9px] uppercase px-2 py-0.5 rounded bg-orange-500/10 text-orange-400 border border-orange-500/20">
+                    {conversations.length} turns
+                  </span>
+                </div>
+
+                <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar min-h-[140px]">
+                  <AnimatePresence>
+                    {conversations.length === 0 ? (
+                      <div className="h-full flex flex-col items-center justify-center text-center py-10">
+                        <MessageSquareOff className="h-7 w-7 text-slate-700/60 mb-2" />
+                        <span className="label-mono text-slate-500 text-[10px]">Memories are empty</span>
+                      </div>
+                    ) : (
+                      conversations.map((msg) => (
+                        <motion.div
+                          key={msg.id}
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className={`p-3 rounded-xl border leading-relaxed ${
+                            msg.role === "user" 
+                              ? "bg-emerald-500/5 border-emerald-500/10" 
+                              : "bg-orange-500/5 border-orange-500/10"
+                          }`}
+                        >
+                          <div className="flex justify-between items-center text-[9px] font-mono mb-1.5">
+                            <span className={msg.role === "user" ? "text-emerald-400 font-bold" : "text-orange-400 font-bold"}>
+                              {msg.role === "user" ? "👤 KRISHNA SIR" : "🤖 MAX VOICE"}
+                            </span>
+                            <span className="text-slate-500">
+                              {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-300 font-sans">{msg.text}</p>
+                        </motion.div>
+                      ))
+                    )}
+                  </AnimatePresence>
+                </div>
+
+                {conversations.length > 0 && (
+                  <button
+                    onClick={clearConversationHistory}
+                    className="mt-3.5 pt-3 border-t border-white/5 w-full py-2 bg-red-950/15 hover:bg-red-950/30 border border-red-500/20 font-mono text-[9px] font-bold uppercase tracking-wider text-red-400 hover:text-red-300 rounded-xl flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    <span>Clear past conversation history</span>
+                  </button>
                 )}
-              </AnimatePresence>
-            </div>
-          </div>
+              </div>
+            </>
+          )}
 
         </section>
 
       </main>
+      )}
 
       {/* FOOTER METADATA CONTROLLER BLOCK */}
       <footer className="relative z-10 w-full max-w-7xl mx-auto px-6 py-4 flex flex-col sm:flex-row items-center justify-between border-t border-white/5 text-[9px] font-mono text-slate-500 gap-4">

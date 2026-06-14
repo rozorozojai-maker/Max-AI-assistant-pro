@@ -1,0 +1,41 @@
+{
+  "entities": {
+    "Preference": {
+      "title": "Preference",
+      "description": "User preferences for the voice assistant MAX",
+      "type": "object",
+      "properties": {
+        "authorizedUser": { "type": "string", "description": "The name of the authorized user (e.g. Krishna Sir)" },
+        "voice": { "type": "string", "description": "Active voice timbre for MAX (e.g. Puck)" },
+        "sarcasm": { "type": "integer", "description": "Sarcastic Roast level (0-100)" },
+        "stubborn": { "type": "integer", "description": "Obstinate Grumble level (0-100)" },
+        "mummy": { "type": "integer", "description": "Indian Mom Scolding level (0-100)" },
+        "warmth": { "type": "integer", "description": "Warm & Chill Bro level (0-100)" },
+        "customDirectives": { "type": "string", "description": "Custom prompt directives or user memory" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last updated timestamp" }
+      },
+      "required": ["voice", "sarcasm", "stubborn", "mummy", "warmth", "updatedAt"]
+    },
+    "Message": {
+      "title": "Conversation Message",
+      "description": "A single spoken turn in a conversation log",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["user", "model"], "description": "Who spoke the message" },
+        "text": { "type": "string", "description": "Text transcript of the message" },
+        "timestamp": { "type": "string", "format": "date-time", "description": "Spoken timestamp" }
+      },
+      "required": ["role", "text", "timestamp"]
+    }
+  },
+  "firestore": {
+    "preferences/{userId}": {
+      "schema": "Preference",
+      "description": "Voice and personality preferences of a user"
+    },
+    "preferences/{userId}/conversations/{messageId}": {
+      "schema": "Message",
+      "description": "Past conversation text transcripts/log turns"
+    }
+  }
+}
